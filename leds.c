@@ -1,5 +1,5 @@
-#include "leds.h"
 #include "config.h"
+#include "leds.h"
 
 //software pwm for leds
 
@@ -21,21 +21,25 @@ volatile unsigned char ledBrightness[NUM_LEDS];
 //105728 interrupts/s ( every 9,45823us) = ~413hz led update rate 
 #define TIMER_START (65536-19) 
 
-extern volatile unsigned char strobeCnt; //declared in main.c
+volatile unsigned char strobeCount;
+volatile unsigned char micCount; // count number of audio detected samples
 
 void ledInit()
 {
-    P3_4 = 0;
-    P3_5 = 0;
-    P2_1 = 0;
-    P2_2 = 0;
-    P2_3 = 0;
-    P2_4 = 0;
-    P2_5 = 0;
-    P2_6 = 0;
+    
+#ifdef ORIGINAL_DEVICE 
+    //  8 channel controller
+    P3 &= (~0x30);
+    P2 &= (~0x7E);
 
     P3M0 = 0x30; //set P3.4 and P3.5 to strong push pull output
     P2M0 = 0x7e; //set P2.1 - P2.6 to strong push pull output
+#else
+    // 3 channel  STC15 device
+    P1 &= (~0x0B);
+
+    P1M0 |= 0x0B; // set P1.0,P1.1, and P1.3 to strong push pull output
+#endif
 
     AUXR &= ~0x80;   // Set timer0 clock source to sysclk/12 (12T mode)
     TMOD &= 0xF0;    // Clear 4bit field for timer0
@@ -57,98 +61,56 @@ void ledInit()
     TR0 = 1; // Start Timer 0
 }
 
-
-volatile unsigned char timer0Cnt = 0;
 void timer0Interrupt()  __interrupt(TF0_VECTOR) __using(1)
 {
+   static volatile unsigned char timer0Cnt = 0;
 
-    //FIXME this code is not generic at all because there seems to be no way
-    //      to put __sbit into an array? wtf?
+   // Read::Modify::Write should be safe in interrupt context
+   unsigned char temp_byte;
 
-    //NOTE currently 255 is not fully on, it will still turn of for one cycle.
+    // This code is not generic and kept unrolled for performance. 
+
+    //NOTE currently 255 is not fully on, it will still turn off for one cycle.
     // FIXME try to fix it without decreasing the performance
-    if(timer0Cnt < ledBrightness[0])
-    {
-        P3_4 = 1;
-    }
-    else
-    {
-        P3_4 = 0;
-    }
+    // LabRat: 
+    //       Could try temp_byte |= ((time0Cnt<= ledBrightness[x]) && (ledBrightness[x])<<y);
+    //       This would give 0 to 255 (always off and always on for extreme limits)
 
-    if(timer0Cnt < ledBrightness[1])
-    {
-        P3_5 = 1;
-    }
-    else
-    {
-        P3_5 = 0;
-    }
+#ifdef ORIGINAL_DEVICE 
+    //  8 channel controller
+    temp_byte = P3&(~0x30);
+    temp_byte |= ((timer0Cnt < ledBrightness[0])<<4); 
+    temp_byte |= ((timer0Cnt < ledBrightness[1])<<5); 
+    P3 = temp_byte;
 
-    if(timer0Cnt < ledBrightness[2])
-    {
-        P2_1 = 1;
-    }
-    else
-    {
-        P2_1 = 0;
-    }
+    temp_byte = P2&(~0x7E);
+    temp_byte |= ((timer0Cnt < ledBrightness[2])<<1); 
+    temp_byte |= ((timer0Cnt < ledBrightness[3])<<2); 
+    temp_byte |= ((timer0Cnt < ledBrightness[4])<<3); 
+    temp_byte |= ((timer0Cnt < ledBrightness[5])<<4); 
+    temp_byte |= ((timer0Cnt < ledBrightness[6])<<5); 
+    temp_byte |= ((timer0Cnt < ledBrightness[7])<<6); 
+    P2 = temp_byte;
+#else
+    // 3 channel  STC15 device
+    temp_byte = P1&(~0x0B);
+    // Warning: This method will over-write the weak-pullups if a 0 is read
+    temp_byte |= (((timer0Cnt <= ledBrightness[0])&&ledBrightness[0])<<3);//RED
+    temp_byte |= (((timer0Cnt <= ledBrightness[1])&&ledBrightness[1])<<1);//VERT
+    temp_byte |= (((timer0Cnt <= ledBrightness[2])&&ledBrightness[2]));   //BLUE
+    P1 = temp_byte| 0x30; // Add the weak-pullups
+#endif
 
-    if(timer0Cnt < ledBrightness[3])
-    {
-        P2_2 = 1;
-    }
-    else
-    {
-        P2_2 = 0;
-    }
-
-    if(timer0Cnt < ledBrightness[4])
-    {
-        P2_3 = 1;
-    }
-    else
-    {
-        P2_3 = 0;
-    }
-
-    if(timer0Cnt < ledBrightness[5])
-    {
-        P2_4 = 1;
-    }
-    else
-    {
-        P2_4 = 0;
-    }
-
-    if(timer0Cnt < ledBrightness[6])
-    {
-        P2_5 = 1;
-    }
-    else
-    {
-        P2_5 = 0;
-    }
-
-    if(timer0Cnt < ledBrightness[7])
-    {
-        P2_6 = 1;
-    }
-    else
-    {
-        P2_6 = 0;
-    }
-
-    //Ideally the strobe should be handled by a different
     //timer but some of the WS-DMX boards use really simple
     //STC controllers that only have two timers.
     //Therefore we generate the strobe tick in here.
-    //one increment of strobeCnt is ~2.48ms
+    //one increment of strobeCount is ~2.48ms
     if(timer0Cnt == 255)
     {
-        strobeCnt++;
+        strobeCount++;
+        micCount = 0;
     }
-
+    micCount += (P5_5 == 0);
     timer0Cnt++;
 
 }

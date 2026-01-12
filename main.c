@@ -1,63 +1,92 @@
-#include <mcs51/lint.h>
-#include <mcs51/8051.h>
-#include "stc15w.h"
-#include "delay.h"
-#include "uart.h"
-#include "dip.h"
 #include "config.h"
+#include "dmx.h"
+#include "dip.h"
 #include "leds.h"
 
 //400 interrupts/s 
-#define STROBE_TIMER_START (65536-FOSC/12/400)
 // on time of a strobe flash in ~2.5ms steps
 #define STROBE_ON_TIME_MS 3
 
+volatile unsigned char  functionCache = 1; // Assert in DMX mode to begin
+volatile unsigned short switchCache=0x8000;  // Out of range, to force 1st read
 
-extern volatile unsigned char dmxData[NUM_ADRESSES]; //defined in uart.c
-extern unsigned short dmxAddr; //defined in uart.c
-unsigned char functionBit = 0;
-extern unsigned char ledBrightness[NUM_LEDS]; //defined in leds.c
+unsigned short masterBrightness = 0;
 
-/** this value is increased by the led timer every 2,42130688ms .
- *  It is used in the strobe logic.
- *  The strobe logic also resets this value to zero every time a strobe flash finishes.
- *  The maximum delay the timer can achieve is  637ms */
-volatile unsigned char strobeCnt = 0;
+#define NUM_LIGHT_SEQ 8
+unsigned char currentPattern = 0;
+const unsigned char SEQUENCE[NUM_LIGHT_SEQ][3] = {
+   {0x00,0x00,0x00},
+   {0xFF,0x00,0x00},
+   {0x00,0xFF,0x00},
+   {0x00,0x00,0xFF},
+   {0x80,0x80,0x00},
+   {0x00,0x80,0x80},
+   {0x80,0x00,0x80},
+   {0xFF,0xFF,0xFF}
+  };
 
-//used to clicker the power led
-unsigned char pwrLedCnt = 0;
+#ifdef PWR_LED
+   //used to clicker the power led
+   unsigned char pwrLedCnt = 0;
 
-inline void flickerPwrLed()
+   inline void flickerPwrLed()
+   {
+       //if power led has been turned off by uart, leave it off for 255 loop iterations
+       if(PWR_LED)
+       {
+           pwrLedCnt++;
+           if(pwrLedCnt == 255)
+           {
+               //turn on power led 
+               //uart turns it off when it has received a correct frame.
+               //this results in flickering if dmx is present and steady on if no dmx present.
+               PWR_LED = 0;
+               pwrLedCnt = 0;
+           }
+       }
+   }
+#endif
+
+void readDipSwitch()
 {
-    //if power led has been turned off by uart, leave it off for 255 loop iterations
-    if(P0_3)
-    {
-        pwrLedCnt++;
-        if(pwrLedCnt == 255)
-        {
-            //turn on power led 
-            //uart turns it off when it has received a correct frame.
-            //this results in flickering if dmx is present and steady on if no dmx present.
-            P0_3 = 0;
-            pwrLedCnt = 0;
-        }
-    }
-}
+    unsigned short tempValues = readDmxAddr();
+    unsigned char functionBit = readFunctionDip();
+    unsigned char staticUpdate = 0;
 
-inline void readDipSwitch()
-{
-    dmxAddr = readDmxAddr();
- 
-    if(dmxAddr == 0)
-    {
-        dmxAddr = 1;
-    }
-    if(dmxAddr > 512 - NUM_ADRESSES)
-    {
-        dmxAddr = 512 - NUM_ADRESSES;
+    if (functionBit != functionCache) {
+       functionCache = functionBit;
+       if (!functionCache) {
+          // Toggle TO static.. update leds
+          staticUpdate = 1;
+       }
     }
 
-    functionBit = readFunctionDip();
+    if (switchCache != tempValues)  {
+       switchCache = tempValues;
+
+       if (tempValues == 0) {
+              tempValues = 1;
+       } else {
+          if (tempValues > 512 - NUM_ADDRESSES) {
+             tempValues = 512 - NUM_ADDRESSES;
+          }
+       }
+       dmxSetAddress(tempValues);
+       if (!functionCache) {
+          // change to dip switch while static.
+          //  so update the leds
+          staticUpdate = 1;
+       }
+    } 
+
+    if (staticUpdate) {
+       // Static Display : lamp values pulled from DIP settings
+       ledBrightness[0] = (switchCache&0x07)<<5; // RED   (3 bits)
+       ledBrightness[1] = (switchCache&0x38)<<2; // GREEN (3 bits)
+       ledBrightness[2] = (switchCache&0xC0); // BLUE  (2 bits)
+       masterBrightness = 255;
+    }
+
 }
 
 
@@ -86,92 +115,106 @@ inline unsigned char calcStrobeTimeMs(unsigned char strobeDmxVal)
 
 void main()
 {
-    unsigned short masterBrightness = 0;
+#ifdef USE_STROBE
     unsigned char strobeDmx = 0;
     unsigned char strobeOffTime = 0;
     
     unsigned char oldStrobe = 0;
     unsigned char strobeOn = 0; //current state of strobe (led on or off)
-    
+#endif
+
 
     dipInit();
 
     readDipSwitch();
 
-    uartInit(); //initially sets AUXR
     ledInit(); //modifies AUXR
 
-    P0_3 = 0; //turn on power
+    dmxUartInit(); //initially sets AUXR
+
+#ifdef PWR_LED
+    PWR_LED = 0; //turn on power
+#endif
 
     while(1)
     {
+#ifdef PWR_LED
         flickerPwrLed();
+#endif
         readDipSwitch();
 
-        strobeDmx = dmxData[1];
-        if(!oldStrobe && strobeDmx)
-        {
-            //strobe has been turned on, reset strobe start time to now
-            strobeCnt = 0;
-            strobeOn = 1;
-        }
-        oldStrobe = strobeDmx;
+        if (functionCache) { // If mode = DMX
+#ifdef USE_STROBE
+           strobeDmx = dmxData[1];
+           if(!oldStrobe && strobeDmx) {
+               //strobe has been turned on, reset strobe start time to now
+               strobeCount = 0;
+               strobeOn = 1;
+           }
+           oldStrobe = strobeDmx;
 
-        if(strobeDmx)
-        {
-            if(strobeOn)
-            {
-                //check if strobe flash needs to be turned off
-                if(strobeCnt >= STROBE_ON_TIME_MS)
-                {
-                    //led was on long enough, turn off
-                    masterBrightness = 0;
-                    strobeOn = 0;
-                    strobeCnt = 0;
-                }
-                else
-                {
-                    //led should stay on (or turn on)
-                    masterBrightness = dmxData[0];
-                }
+           if(strobeDmx) {
+               if(strobeOn) {
+                   //check if strobe flash needs to be turned off
+                   if(strobeCount >= STROBE_ON_TIME_MS) {
+                       //led was on long enough, turn off
+                       masterBrightness = 0;
+                       strobeOn = 0;
+                       strobeCount = 0;
+                   } else {
+                       //led should stay on (or turn on)
+                       masterBrightness = dmxData[0];
+                   }
+               } else {
+                   strobeOffTime = calcStrobeTimeMs(strobeDmx);
+                   //check if it is time to turn on strobe
+                   if(strobeCount > strobeOffTime) {
+                       //time to turn the strobe back on
+                       masterBrightness = dmxData[0];
+                       strobeOn = 1;
+                       strobeCount = 0;
+                   } else {
+                       //leave it off a little longer (or turn it off)
+                       masterBrightness = 0;
+                   }
+               }
+           } else 
+#endif
+           {
+               masterBrightness = dmxData[0];
+           }
+
+           // The master scaling is done in fixed point math with scale 255
+           // 255 was chosen because it allows to ommit scaling of masterBrightness
+           // and is close to the theoretical maximum scale of 257 
+           // (255*257=biggest possible unsigned short).
+
+           //loop unrolled for performance reasons
+           ledBrightness[0] = (dmxData[2] * masterBrightness) / 255; // RED
+           ledBrightness[1] = (dmxData[3] * masterBrightness) / 255; // GREEN
+           ledBrightness[2] = (dmxData[4] * masterBrightness) / 255; // BLUE
+
+#if NUM_LEDS > 3
+           ledBrightness[3] = (dmxData[5] * masterBrightness) / 255;
+           ledBrightness[4] = (dmxData[6] * masterBrightness) / 255;
+           ledBrightness[5] = (dmxData[7] * masterBrightness) / 255;
+           ledBrightness[6] = (dmxData[8] * masterBrightness) / 255;
+           ledBrightness[7] = (dmxData[9] * masterBrightness) / 255;
+#endif
+       } else {
+#ifdef MIC_INPUT
+         // THIS is the MICROPHONE INPUT code
+         if (switchCache == 0) {
+            if (micCount) { // Arbitrary sensitivity could be >10?
+               currentPattern = (currentPattern+1)&(NUM_LIGHT_SEQ-1);;
+               ledBrightness[0] = SEQUENCE[currentPattern][0];
+               ledBrightness[1] = SEQUENCE[currentPattern][1];
+               ledBrightness[2] = SEQUENCE[currentPattern][2];
             }
-            else
-            {
-                strobeOffTime = calcStrobeTimeMs(strobeDmx);
-                //check if it is time to turn on strobe
-                if(strobeCnt > strobeOffTime)
-                {
-                    //time to turn the strobe back on
-                    masterBrightness = dmxData[0];
-                    strobeOn = 1;
-                    strobeCnt = 0;
-                }
-                else
-                {
-                    //leave it off a little longer (or turn it off)
-                    masterBrightness = 0;
-                }
-            }
-        }
-        else
-        {
-            masterBrightness = dmxData[0];
-        }
+         }
+#endif
+       }
 
-
-        // The master scaling is done in fixed point math with scale 255
-        // 255 was chosen because it allows to ommit scaling of masterBrightness
-        // and is close to the theoretical maximum scale of 257 
-        // (255*257=biggest possible unsigned short).
-
-        //loop unrolled for performance reasons
-        ledBrightness[0] = (dmxData[2] * masterBrightness) / 255;
-        ledBrightness[1] = (dmxData[3] * masterBrightness) / 255;
-        ledBrightness[2] = (dmxData[4] * masterBrightness) / 255;
-        ledBrightness[3] = (dmxData[5] * masterBrightness) / 255;
-        ledBrightness[4] = (dmxData[6] * masterBrightness) / 255;
-        ledBrightness[5] = (dmxData[7] * masterBrightness) / 255;
-        ledBrightness[6] = (dmxData[8] * masterBrightness) / 255;
-        ledBrightness[7] = (dmxData[9] * masterBrightness) / 255;
+       WDT_CONTR = 0x3C; // Feed the watchdog
     }
 }
