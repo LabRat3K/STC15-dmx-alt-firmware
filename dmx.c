@@ -6,7 +6,7 @@ unsigned short dmxAddr = 0;
 
 #ifdef TX_DEBUG
 // A tiny Transmit Buffer 
-#define TXBUFFERSIZE 32
+#define TXBUFFERSIZE 16
 unsigned char txQueue[TXBUFFERSIZE];
 unsigned char txHead=0;
 volatile unsigned char txTail=0;
